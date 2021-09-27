@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
 import argparse
 import json
@@ -8,10 +8,10 @@ import os
 from collections import defaultdict
 import cv2
 import tqdm
+from fvcore.common.file_io import PathManager
 
 from detectron2.data import DatasetCatalog, MetadataCatalog
 from detectron2.structures import Boxes, BoxMode, Instances
-from detectron2.utils.file_io import PathManager
 from detectron2.utils.logger import setup_logger
 from detectron2.utils.visualizer import Visualizer
 
@@ -21,8 +21,10 @@ def create_instances(predictions, image_size):
 
     score = np.asarray([x["score"] for x in predictions])
     chosen = (score > args.conf_threshold).nonzero()[0]
+    if chosen.shape[0] == 0:
+        return None
     score = score[chosen]
-    bbox = np.asarray([predictions[i]["bbox"] for i in chosen]).reshape(-1, 4)
+    bbox = np.asarray([predictions[i]["bbox"] for i in chosen])
     bbox = BoxMode.convert(bbox, BoxMode.XYWH_ABS, BoxMode.XYXY_ABS)
 
     labels = np.asarray([dataset_id_map(predictions[i]["category_id"]) for i in chosen])
@@ -80,11 +82,14 @@ if __name__ == "__main__":
         basename = os.path.basename(dic["file_name"])
 
         predictions = create_instances(pred_by_image[dic["image_id"]], img.shape[:2])
-        vis = Visualizer(img, metadata)
-        vis_pred = vis.draw_instance_predictions(predictions).get_image()
+        if predictions is not None:
+            vis = Visualizer(img, metadata)
+            vis_pred = vis.draw_instance_predictions(predictions).get_image()
+        else:
+            vis_pred = img
 
         vis = Visualizer(img, metadata)
         vis_gt = vis.draw_dataset_dict(dic).get_image()
 
-        concat = np.concatenate((vis_pred, vis_gt), axis=1)
+        concat = np.concatenate((vis_pred, vis_gt), axis=0)
         cv2.imwrite(os.path.join(args.output, basename), concat[:, :, ::-1])

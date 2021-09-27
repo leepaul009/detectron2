@@ -1,57 +1,72 @@
-<img src=".github/Detectron2-Logo-Horz.svg" width="300" >
-
-Detectron2 is Facebook AI Research's next generation library
-that provides state-of-the-art detection and segmentation algorithms.
-It is the successor of
-[Detectron](https://github.com/facebookresearch/Detectron/)
-and [maskrcnn-benchmark](https://github.com/facebookresearch/maskrcnn-benchmark/).
-It supports a number of computer vision research projects and production applications in Facebook.
+# NOH-NMS: Improving Pedestrian Detection by Nearby Objects Hallucination
 
 <div align="center">
-  <img src="https://user-images.githubusercontent.com/1381301/66535560-d3422200-eace-11e9-9123-5535d469db19.png"/>
+  <img src="demo/architecture.png"/>
 </div>
 
-### What's New
-* Includes new capabilities such as panoptic segmentation, Densepose, Cascade R-CNN, rotated bounding boxes, PointRend,
-  DeepLab, etc.
-* Used as a library to support building [research projects](projects/) on top of it.
-* Models can be exported to TorchScript format or Caffe2 format for deployment.
-* It [trains much faster](https://detectron2.readthedocs.io/notes/benchmarks.html).
+The offical implementation for the ["NOH-NMS: Improving Pedestrian Detection by Nearby Objects Hallucination"](https://arxiv.org/pdf/2007.13376.pdf) which is published in **ACM MM 2020**. 
 
-See our [blog post](https://ai.facebook.com/blog/-detectron2-a-pytorch-based-modular-object-detection-library-/)
-to see more demos and learn about detectron2.
+We propose Nearby Objects Hallucinator (NOH), which pinpoints the objects nearby each proposal with a Gaussian distribution, together with NOH-NMS, which dynamically eases the suppression for the space that might contain other objects with a high likelihood.
+
+This work has won the **first place** at the [CrowdHuman Challenge, 2020](http://competition.baai.ac.cn/c/34/rank/timeline/68?sourceType=public).
+
+<div align="center">
+  <img src="demo/crowdhuman-comp.png"/>
+</div>
+
+* This repo is implemented based on [detectron2](https://github.com/facebookresearch/detectron2).
+
+## Performance
+|    Model    | Backbone |  AP  |  Recall |  MR  | Weights |
+|-------------|----------|------|---------|------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Faster RCNN | ResNet-50| 85.0 |   87.5  | 44.5 | [faster_rcnn_model_final.pth](https://api.onedrive.com/v1.0/shares/u!aHR0cHM6Ly8xZHJ2Lm1zL3UvcyFBdl9rR0czS2U3dXRiMmZ6elBoTkdHUV9BcG8_ZT1mYVFwUVo/root/content) |
+|   NOH-NMS   | ResNet-50| 88.8 |   92.6  | 43.7 | [noh_nms_model_final.pth](https://api.onedrive.com/v1.0/shares/u!aHR0cHM6Ly8xZHJ2Lm1zL3UvcyFBdl9rR0czS2U3dXRjSVpvQWJQYjVPMUlWMHc_ZT00RXJZQWg/root/content)     |
+
+## Prepare Datasets
+Download the CrowdHuman Datasets from http://www.crowdhuman.org/, and then move them under the directory like:
+```
+./data/crowdhuman
+├── annotations
+│   └── annotation_train.odgt
+│   └── annotation_val.odgt
+├── images
+│   └── train
+│   └── val
+```
 
 ## Installation
+```
+  cd detectron2
+  pip install -e . 
+  #or rebuild
+  sh build.sh
+```
 
-See [installation instructions](https://detectron2.readthedocs.io/tutorials/install.html).
+## Training in Command Line
+Train Faster RCNN on 8 gpus:
+```
+python tools/train_net.py --num-gpus 8 --config-file configs/CrowdHuman/faster_rcnn_R_50_FPN_baseline_iou_0.5.yaml
+```
 
-## Getting Started
+Train NOH-NMS on 8 gpus:
+```
+python tools/train_net.py --num-gpus 8 --config-file configs/CrowdHuman/faster_rcnn_R_50_FPN_baseline_iou_0.5_noh_nms.yaml
+```
 
-See [Getting Started with Detectron2](https://detectron2.readthedocs.io/tutorials/getting_started.html),
-and the [Colab Notebook](https://colab.research.google.com/drive/16jcaJoc6bCFAQ96jDe2HwtXj7BMD_-m5)
-to learn about basic usage.
+## Quick Start
+See [GETTING_STARTED.md](GETTING_STARTED.md) in detectron2
 
-Learn more at our [documentation](https://detectron2.readthedocs.org).
-And see [projects/](projects/) for some projects that are built on top of detectron2.
+## Acknowledgement
+* [detectron2](https://github.com/facebookresearch/detectron2)
 
-## Model Zoo and Baselines
-
-We provide a large set of baseline results and trained models available for download in the [Detectron2 Model Zoo](MODEL_ZOO.md).
-
-## License
-
-Detectron2 is released under the [Apache 2.0 license](LICENSE).
-
-## Citing Detectron2
-
-If you use Detectron2 in your research or wish to refer to the baseline results published in the [Model Zoo](MODEL_ZOO.md), please use the following BibTeX entry.
-
-```BibTeX
-@misc{wu2019detectron2,
-  author =       {Yuxin Wu and Alexander Kirillov and Francisco Massa and
-                  Wan-Yen Lo and Ross Girshick},
-  title =        {Detectron2},
-  howpublished = {\url{https://github.com/facebookresearch/detectron2}},
-  year =         {2019}
+## Citation
+if you find this project useful for your research, please cite:
+```
+@inproceedings{zhou2020noh,
+  title={NOH-NMS: Improving Pedestrian Detection by Nearby Objects Hallucination},
+  author={Zhou, Penghao and Zhou, Chong and Peng, Pai and Du, Junlong and Sun, Xing and Guo, Xiaowei and Huang, Feiyue},
+  booktitle={Proceedings of the 28th ACM International Conference on Multimedia},
+  pages={1967--1975},
+  year={2020}
 }
 ```

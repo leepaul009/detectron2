@@ -1,14 +1,12 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import datetime
 import logging
 import time
-from collections import OrderedDict, abc
-from contextlib import ExitStack, contextmanager
-from typing import List, Union
+from collections import OrderedDict
+from contextlib import contextmanager
 import torch
-from torch import nn
 
-from detectron2.utils.comm import get_world_size, is_main_process
+from detectron2.utils.comm import is_main_process
 from detectron2.utils.logger import log_every_n_seconds
 
 
@@ -30,20 +28,13 @@ class DatasetEvaluator:
         """
         pass
 
-    def process(self, inputs, outputs):
+    def process(self, input, output):
         """
-        Process the pair of inputs and outputs.
-        If they contain batches, the pairs can be consumed one-by-one using `zip`:
-
-        .. code-block:: python
-
-            for input_, output in zip(inputs, outputs):
-                # do evaluation on single input/output pair
-                ...
+        Process an input/output pair.
 
         Args:
-            inputs (list): the inputs that's used to call the model.
-            outputs (list): the return value of `model(inputs)`
+            input: the input that's used to call the model.
+            output: the return value of `model(input)`
         """
         pass
 
@@ -64,18 +55,7 @@ class DatasetEvaluator:
 
 
 class DatasetEvaluators(DatasetEvaluator):
-    """
-    Wrapper class to combine multiple :class:`DatasetEvaluator` instances.
-
-    This class dispatches every evaluation call to
-    all of its :class:`DatasetEvaluator`.
-    """
-
     def __init__(self, evaluators):
-        """
-        Args:
-            evaluators (list): the evaluators to combine.
-        """
         super().__init__()
         self._evaluators = evaluators
 
@@ -83,9 +63,9 @@ class DatasetEvaluators(DatasetEvaluator):
         for evaluator in self._evaluators:
             evaluator.reset()
 
-    def process(self, inputs, outputs):
+    def process(self, input, output):
         for evaluator in self._evaluators:
-            evaluator.process(inputs, outputs)
+            evaluator.process(input, output)
 
     def evaluate(self):
         results = OrderedDict()
@@ -100,103 +80,77 @@ class DatasetEvaluators(DatasetEvaluator):
         return results
 
 
-def inference_on_dataset(
-    model, data_loader, evaluator: Union[DatasetEvaluator, List[DatasetEvaluator], None]
-):
+def inference_on_dataset(model, data_loader, evaluator):
     """
     Run model on the data_loader and evaluate the metrics with evaluator.
-    Also benchmark the inference speed of `model.__call__` accurately.
+    Also benchmark the inference speed of `model.forward` accurately.
     The model will be used in eval mode.
 
     Args:
-        model (callable): a callable which takes an object from
-            `data_loader` and returns some outputs.
+        model (nn.Module): a module which accepts an object from
+            `data_loader` and returns some outputs. It will be temporarily set to `eval` mode.
 
-            If it's an nn.Module, it will be temporarily set to `eval` mode.
             If you wish to evaluate a model in `training` mode instead, you can
             wrap the given model and override its behavior of `.eval()` and `.train()`.
         data_loader: an iterable object with a length.
             The elements it generates will be the inputs to the model.
-        evaluator: the evaluator(s) to run. Use `None` if you only want to benchmark,
-            but don't want to do any evaluation.
+        evaluator (DatasetEvaluator): the evaluator to run. Use `None` if you only want
+            to benchmark, but don't want to do any evaluation.
 
     Returns:
         The return value of `evaluator.evaluate()`
     """
-    num_devices = get_world_size()
+    num_devices = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
     logger = logging.getLogger(__name__)
-    logger.info("Start inference on {} batches".format(len(data_loader)))
+    logger.info("Start inference on {} images".format(len(data_loader)))
 
     total = len(data_loader)  # inference data loader must have a fixed length
     if evaluator is None:
         # create a no-op evaluator
         evaluator = DatasetEvaluators([])
-    if isinstance(evaluator, abc.MutableSequence):
-        evaluator = DatasetEvaluators(evaluator)
     evaluator.reset()
 
     num_warmup = min(5, total - 1)
     start_time = time.perf_counter()
-    total_data_time = 0
     total_compute_time = 0
-    total_eval_time = 0
-    with ExitStack() as stack:
-        if isinstance(model, nn.Module):
-            stack.enter_context(inference_context(model))
-        stack.enter_context(torch.no_grad())
-
-        start_data_time = time.perf_counter()
+    with inference_context(model), torch.no_grad():
         for idx, inputs in enumerate(data_loader):
-            total_data_time += time.perf_counter() - start_data_time
             if idx == num_warmup:
                 start_time = time.perf_counter()
-                total_data_time = 0
                 total_compute_time = 0
-                total_eval_time = 0
 
             start_compute_time = time.perf_counter()
             outputs = model(inputs)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             total_compute_time += time.perf_counter() - start_compute_time
-
-            start_eval_time = time.perf_counter()
             evaluator.process(inputs, outputs)
-            total_eval_time += time.perf_counter() - start_eval_time
 
             iters_after_start = idx + 1 - num_warmup * int(idx >= num_warmup)
-            data_seconds_per_iter = total_data_time / iters_after_start
-            compute_seconds_per_iter = total_compute_time / iters_after_start
-            eval_seconds_per_iter = total_eval_time / iters_after_start
-            total_seconds_per_iter = (time.perf_counter() - start_time) / iters_after_start
-            if idx >= num_warmup * 2 or compute_seconds_per_iter > 5:
-                eta = datetime.timedelta(seconds=int(total_seconds_per_iter * (total - idx - 1)))
+            seconds_per_img = total_compute_time / iters_after_start
+            if idx >= num_warmup * 2 or seconds_per_img > 5:
+                total_seconds_per_img = (time.perf_counter() - start_time) / iters_after_start
+                eta = datetime.timedelta(seconds=int(total_seconds_per_img * (total - idx - 1)))
                 log_every_n_seconds(
                     logging.INFO,
-                    (
-                        f"Inference done {idx + 1}/{total}. "
-                        f"Dataloading: {data_seconds_per_iter:.4f} s/iter. "
-                        f"Inference: {compute_seconds_per_iter:.4f} s/iter. "
-                        f"Eval: {eval_seconds_per_iter:.4f} s/iter. "
-                        f"Total: {total_seconds_per_iter:.4f} s/iter. "
-                        f"ETA={eta}"
+                    "Inference done {}/{}. {:.4f} s / img. ETA={}".format(
+                        idx + 1, total, seconds_per_img, str(eta)
                     ),
                     n=5,
                 )
-            start_data_time = time.perf_counter()
 
     # Measure the time only for this worker (before the synchronization barrier)
     total_time = time.perf_counter() - start_time
     total_time_str = str(datetime.timedelta(seconds=total_time))
     # NOTE this format is parsed by grep
     logger.info(
-        "Total inference time: {} ({:.6f} s / iter per device, on {} devices)".format(
+        "Total inference time: {} ({:.6f} s / img per device, on {} devices)".format(
             total_time_str, total_time / (total - num_warmup), num_devices
         )
     )
     total_compute_time_str = str(datetime.timedelta(seconds=int(total_compute_time)))
     logger.info(
-        "Total inference pure compute time: {} ({:.6f} s / iter per device, on {} devices)".format(
+        "Total inference pure compute time: {} ({:.6f} s / img per device, on {} devices)".format(
             total_compute_time_str, total_compute_time / (total - num_warmup), num_devices
         )
     )

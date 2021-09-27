@@ -1,11 +1,11 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import math
-import fvcore.nn.weight_init as weight_init
 import torch
+import fvcore.nn.weight_init as weight_init
 import torch.nn.functional as F
 from torch import nn
 
-from detectron2.layers import Conv2d, ShapeSpec, get_norm
+from detectron2.layers import Conv2d, ShapeSpec, get_norm, DeformConv, ModulatedDeformConv
 
 from .backbone import Backbone
 from .build import BACKBONE_REGISTRY
@@ -16,14 +16,19 @@ __all__ = ["build_resnet_fpn_backbone", "build_retinanet_resnet_fpn_backbone", "
 
 class FPN(Backbone):
     """
-    This module implements :paper:`FPN`.
+    This module implements Feature Pyramid Network.
     It creates pyramid features built on top of some input feature maps.
     """
 
-    _fuse_type: torch.jit.Final[str]
-
     def __init__(
-        self, bottom_up, in_features, out_channels, norm="", top_block=None, fuse_type="sum"
+        self,
+        bottom_up,
+        in_features,
+        out_channels,
+        norm="",
+        top_block=None,
+        fuse_type="sum",
+        addition_ensemble="",
     ):
         """
         Args:
@@ -50,37 +55,62 @@ class FPN(Backbone):
         """
         super(FPN, self).__init__()
         assert isinstance(bottom_up, Backbone)
-        assert in_features, in_features
 
         # Feature map strides and channels from the bottom up network (e.g. ResNet)
         input_shapes = bottom_up.output_shape()
-        strides = [input_shapes[f].stride for f in in_features]
-        in_channels_per_feature = [input_shapes[f].channels for f in in_features]
+        in_strides = [input_shapes[f].stride for f in in_features]
+        in_channels = [input_shapes[f].channels for f in in_features]
 
-        _assert_strides_are_log2_contiguous(strides)
+        _assert_strides_are_log2_contiguous(in_strides)
         lateral_convs = []
         output_convs = []
 
         use_bias = norm == ""
-        for idx, in_channels in enumerate(in_channels_per_feature):
+        self.addition_ensemble = addition_ensemble
+        for idx, in_channel in enumerate(in_channels):
             lateral_norm = get_norm(norm, out_channels)
             output_norm = get_norm(norm, out_channels)
 
             lateral_conv = Conv2d(
-                in_channels, out_channels, kernel_size=1, bias=use_bias, norm=lateral_norm
+                in_channel, out_channels, kernel_size=1, bias=use_bias, norm=lateral_norm
             )
-            output_conv = Conv2d(
-                out_channels,
-                out_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                bias=use_bias,
-                norm=output_norm,
-            )
+            if self.addition_ensemble == "LargeDilated":
+                print("large dilated conv in fpn")
+                output_conv = LRFModule(
+                    out_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    bias=use_bias,
+                    norm=norm,
+                )
+            elif self.addition_ensemble == "LargeDeform":
+                print("large deform conv in fpn")
+                output_conv = LRFDCNModule(
+                    out_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    bias=use_bias,
+                    norm=norm,
+                    deform_modulated=True,
+                )
+            else:
+                output_conv = Conv2d(
+                    out_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    bias=use_bias,
+                    norm=output_norm,
+                )
+                weight_init.c2_xavier_fill(output_conv)
             weight_init.c2_xavier_fill(lateral_conv)
-            weight_init.c2_xavier_fill(output_conv)
-            stage = int(math.log2(strides[idx]))
+
+            stage = int(math.log2(in_strides[idx]))
             self.add_module("fpn_lateral{}".format(stage), lateral_conv)
             self.add_module("fpn_output{}".format(stage), output_conv)
 
@@ -91,18 +121,21 @@ class FPN(Backbone):
         self.lateral_convs = lateral_convs[::-1]
         self.output_convs = output_convs[::-1]
         self.top_block = top_block
-        self.in_features = tuple(in_features)
+        self.in_features = in_features
         self.bottom_up = bottom_up
         # Return feature names are "p<stage>", like ["p2", "p3", ..., "p6"]
-        self._out_feature_strides = {"p{}".format(int(math.log2(s))): s for s in strides}
+        self._out_feature_strides = {"p{}".format(int(math.log2(s))): s for s in in_strides}
         # top block output feature maps.
         if self.top_block is not None:
             for s in range(stage, stage + self.top_block.num_levels):
                 self._out_feature_strides["p{}".format(s + 1)] = 2 ** (s + 1)
 
         self._out_features = list(self._out_feature_strides.keys())
-        self._out_feature_channels = {k: out_channels for k in self._out_features}
-        self._size_divisibility = strides[-1]
+        if self.addition_ensemble == "LargeDilated" or self.addition_ensemble == "LargeDeform":
+            self._out_feature_channels = {k: out_channels * 2 for k in self._out_features}
+        else:
+            self._out_feature_channels = {k: out_channels for k in self._out_features}
+        self._size_divisibility = in_strides[-1]
         assert fuse_type in {"avg", "sum"}
         self._fuse_type = fuse_type
 
@@ -123,35 +156,29 @@ class FPN(Backbone):
                 paper convention: "p<stage>", where stage has stride = 2 ** stage e.g.,
                 ["p2", "p3", ..., "p6"].
         """
-        bottom_up_features = self.bottom_up(x)
-        results = []
-        prev_features = self.lateral_convs[0](bottom_up_features[self.in_features[-1]])
-        results.append(self.output_convs[0](prev_features))
-
         # Reverse feature maps into top-down order (from low to high resolution)
-        for idx, (lateral_conv, output_conv) in enumerate(
-            zip(self.lateral_convs, self.output_convs)
+        bottom_up_features = self.bottom_up(x)
+        x = [bottom_up_features[f] for f in self.in_features[::-1]]
+        results = []
+        prev_features = self.lateral_convs[0](x[0])
+        results.append(self.output_convs[0](prev_features))
+        for features, lateral_conv, output_conv in zip(
+            x[1:], self.lateral_convs[1:], self.output_convs[1:]
         ):
-            # Slicing of ModuleList is not supported https://github.com/pytorch/pytorch/issues/47336
-            # Therefore we loop over all modules but skip the first one
-            if idx > 0:
-                features = self.in_features[-idx - 1]
-                features = bottom_up_features[features]
-                top_down_features = F.interpolate(prev_features, scale_factor=2.0, mode="nearest")
-                lateral_features = lateral_conv(features)
-                prev_features = lateral_features + top_down_features
-                if self._fuse_type == "avg":
-                    prev_features /= 2
-                results.insert(0, output_conv(prev_features))
+            top_down_features = F.interpolate(prev_features, scale_factor=2, mode="nearest")
+            lateral_features = lateral_conv(features)
+            prev_features = lateral_features + top_down_features
+            if self._fuse_type == "avg":
+                prev_features /= 2
+            results.insert(0, output_conv(prev_features))
 
         if self.top_block is not None:
-            if self.top_block.in_feature in bottom_up_features:
-                top_block_in_feature = bottom_up_features[self.top_block.in_feature]
-            else:
+            top_block_in_feature = bottom_up_features.get(self.top_block.in_feature, None)
+            if top_block_in_feature is None:
                 top_block_in_feature = results[self._out_features.index(self.top_block.in_feature)]
             results.extend(self.top_block(top_block_in_feature))
         assert len(self._out_features) == len(results)
-        return {f: res for f, res in zip(self._out_features, results)}
+        return dict(zip(self._out_features, results))
 
     def output_shape(self):
         return {
@@ -160,6 +187,121 @@ class FPN(Backbone):
             )
             for name in self._out_features
         }
+
+
+class LRFModule(nn.Module):
+    """
+    Large Receptive Fusion Module.
+    """
+
+    def __init__(
+        self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True, norm=""
+    ):
+        super().__init__()
+        dilation = 2
+        self.conv1 = Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=bias,
+            norm=get_norm(norm, out_channels),
+        )
+
+        self.conv2 = Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1 * dilation,
+            bias=bias,
+            groups=1,
+            dilation=dilation,
+            norm=get_norm(norm, out_channels),
+        )
+        for conv in [self.conv1, self.conv2]:
+            weight_init.c2_xavier_fill(conv)
+
+    def forward(self, x):
+        x1 = self.conv1(x)
+        x2 = self.conv2(x)
+        return torch.cat((x1, x2), dim=1)
+
+
+class LRFDCNModule(nn.Module):
+    """
+    Large Receptive Fusion Module.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        deform_modulated=True,
+        bias=True,
+        norm="",
+    ):
+        super().__init__()
+        dilation = 2
+        self.deform_modulated = deform_modulated
+        self.conv1 = Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=bias,
+            norm=get_norm(norm, out_channels),
+        )
+        if deform_modulated:
+            deform_conv_op = ModulatedDeformConv
+            offset_channels = 27
+        else:
+            deform_conv_op = DeformConv
+            offset_channels = 18
+
+        self.conv2_offset = Conv2d(
+            in_channels,
+            offset_channels * 1,
+            kernel_size=3,
+            stride=1,
+            padding=1 * dilation,
+            dilation=dilation,
+        )
+        self.conv2 = deform_conv_op(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1 * dilation,
+            bias=False,
+            groups=1,
+            dilation=dilation,
+            deformable_groups=1,
+            norm=get_norm(norm, out_channels),
+        )
+
+        nn.init.constant_(self.conv2_offset.weight, 0)
+        nn.init.constant_(self.conv2_offset.bias, 0)
+        for conv in [self.conv1, self.conv2]:
+            weight_init.c2_xavier_fill(conv)
+
+    def forward(self, x):
+        x1 = self.conv1(x)
+        if self.deform_modulated:
+            offset_mask = self.conv2_offset(x)
+            offset_x, offset_y, mask = torch.chunk(offset_mask, 3, dim=1)
+            offset = torch.cat((offset_x, offset_y), dim=1)
+            mask = mask.sigmoid()
+            x2 = self.conv2(x, offset, mask)
+        else:
+            offset = self.conv2_offset(x)
+            x2 = self.conv2(x, offset)
+        return torch.cat((x1, x2), dim=1)
 
 
 def _assert_strides_are_log2_contiguous(strides):
@@ -185,6 +327,17 @@ class LastLevelMaxPool(nn.Module):
 
     def forward(self, x):
         return [F.max_pool2d(x, kernel_size=1, stride=2, padding=0)]
+        # return [F.max_pool2d(x, kernel_size=2, stride=2, padding=0)]
+
+
+class LastLevelAvgPool(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.num_levels = 1
+        self.in_feature = "p5"
+
+    def forward(self, x):
+        return [F.avg_pool2d(x, kernel_size=2, stride=2, padding=0)]
 
 
 class LastLevelP6P7(nn.Module):
@@ -227,6 +380,77 @@ def build_resnet_fpn_backbone(cfg, input_shape: ShapeSpec):
         norm=cfg.MODEL.FPN.NORM,
         top_block=LastLevelMaxPool(),
         fuse_type=cfg.MODEL.FPN.FUSE_TYPE,
+    )
+    return backbone
+
+
+@BACKBONE_REGISTRY.register()
+def build_resnet_fpn_backbone_better(cfg, input_shape: ShapeSpec):
+    """
+    Args:
+        cfg: a detectron2 CfgNode
+
+    Returns:
+        backbone (Backbone): backbone module, must be a subclass of :class:`Backbone`.
+    """
+    bottom_up = build_resnet_backbone(cfg, input_shape)
+    in_features = cfg.MODEL.FPN.IN_FEATURES
+    out_channels = cfg.MODEL.FPN.OUT_CHANNELS
+    backbone = FPN(
+        bottom_up=bottom_up,
+        in_features=in_features,
+        out_channels=out_channels,
+        norm=cfg.MODEL.FPN.NORM,
+        top_block=LastLevelAvgPool(),
+        fuse_type=cfg.MODEL.FPN.FUSE_TYPE,
+    )
+    return backbone
+
+
+@BACKBONE_REGISTRY.register()
+def build_resnet_fpn_backbone_lrf(cfg, input_shape: ShapeSpec):
+    """
+    Args:
+        cfg: a detectron2 CfgNode
+
+    Returns:
+        backbone (Backbone): backbone module, must be a subclass of :class:`Backbone`.
+    """
+    bottom_up = build_resnet_backbone(cfg, input_shape)
+    in_features = cfg.MODEL.FPN.IN_FEATURES
+    out_channels = cfg.MODEL.FPN.OUT_CHANNELS
+    backbone = FPN(
+        bottom_up=bottom_up,
+        in_features=in_features,
+        out_channels=out_channels,
+        norm=cfg.MODEL.FPN.NORM,
+        top_block=LastLevelAvgPool(),
+        fuse_type=cfg.MODEL.FPN.FUSE_TYPE,
+        addition_ensemble="LargeDilated",
+    )
+    return backbone
+
+
+@BACKBONE_REGISTRY.register()
+def build_resnet_fpn_backbone_lrdcn(cfg, input_shape: ShapeSpec):
+    """
+    Args:
+        cfg: a detectron2 CfgNode
+
+    Returns:
+        backbone (Backbone): backbone module, must be a subclass of :class:`Backbone`.
+    """
+    bottom_up = build_resnet_backbone(cfg, input_shape)
+    in_features = cfg.MODEL.FPN.IN_FEATURES
+    out_channels = cfg.MODEL.FPN.OUT_CHANNELS
+    backbone = FPN(
+        bottom_up=bottom_up,
+        in_features=in_features,
+        out_channels=out_channels,
+        norm=cfg.MODEL.FPN.NORM,
+        top_block=LastLevelAvgPool(),
+        fuse_type=cfg.MODEL.FPN.FUSE_TYPE,
+        addition_ensemble="LargeDeform",
     )
     return backbone
 

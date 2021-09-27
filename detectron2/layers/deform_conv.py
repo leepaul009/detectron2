@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import math
 from functools import lru_cache
 import torch
@@ -6,7 +6,6 @@ from torch import nn
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 from torch.nn.modules.utils import _pair
-from torchvision.ops import deform_conv2d
 
 from detectron2 import _C
 
@@ -47,13 +46,7 @@ class _DeformConv(Function):
         ctx.bufs_ = [input.new_empty(0), input.new_empty(0)]  # columns, ones
 
         if not input.is_cuda:
-            if deformable_groups != 1:
-                raise NotImplementedError(
-                    "Deformable Conv with deformable_groups != 1 is not supported on CPUs!"
-                )
-            return deform_conv2d(
-                input, offset, weight, stride=stride, padding=padding, dilation=dilation
-            )
+            raise NotImplementedError
         else:
             cur_im2col_step = _DeformConv._cal_im2col_step(input.shape[0], ctx.im2col_step)
             assert (input.shape[0] % cur_im2col_step) == 0, "im2col step must divide batchsize"
@@ -87,7 +80,7 @@ class _DeformConv(Function):
         grad_input = grad_offset = grad_weight = None
 
         if not grad_output.is_cuda:
-            raise NotImplementedError("Deformable Conv is not supported on CPUs!")
+            raise NotImplementedError
         else:
             cur_im2col_step = _DeformConv._cal_im2col_step(input.shape[0], ctx.im2col_step)
             assert (input.shape[0] % cur_im2col_step) == 0, "im2col step must divide batchsize"
@@ -207,7 +200,7 @@ class _ModulatedDeformConv(Function):
         if not ctx.with_bias:
             bias = input.new_empty(1)  # fake tensor
         if not input.is_cuda:
-            raise NotImplementedError("Deformable Conv is not supported on CPUs!")
+            raise NotImplementedError
         if (
             weight.requires_grad
             or mask.requires_grad
@@ -244,7 +237,7 @@ class _ModulatedDeformConv(Function):
     @once_differentiable
     def backward(ctx, grad_output):
         if not grad_output.is_cuda:
-            raise NotImplementedError("Deformable Conv is not supported on CPUs!")
+            raise NotImplementedError
         input, offset, mask, weight, bias = ctx.saved_tensors
         grad_input = torch.zeros_like(input)
         grad_offset = torch.zeros_like(offset)
@@ -328,7 +321,7 @@ class DeformConv(nn.Module):
         activation=None,
     ):
         """
-        Deformable convolution from :paper:`deformconv`.
+        Deformable convolution.
 
         Arguments are similar to :class:`Conv2D`. Extra arguments:
 
@@ -365,20 +358,23 @@ class DeformConv(nn.Module):
 
         nn.init.kaiming_uniform_(self.weight, nonlinearity="relu")
 
+    def return_empty(self, x):
+        # When input is empty, we want to return a empty tensor with "correct" shape,
+        # So that the following operations will not panic
+        # if they check for the shape of the tensor.
+        # This computes the height and width of the output tensor
+        output_shape = [
+            (i + 2 * p - (di * (k - 1) + 1)) // s + 1
+            for i, p, di, k, s in zip(
+                x.shape[-2:], self.padding, self.dilation, self.kernel_size, self.stride
+            )
+        ]
+        output_shape = [x.shape[0], self.weight.shape[0]] + output_shape
+        return _NewEmptyTensorOp.apply(x, output_shape)
+
     def forward(self, x, offset):
         if x.numel() == 0:
-            # When input is empty, we want to return a empty tensor with "correct" shape,
-            # So that the following operations will not panic
-            # if they check for the shape of the tensor.
-            # This computes the height and width of the output tensor
-            output_shape = [
-                (i + 2 * p - (di * (k - 1) + 1)) // s + 1
-                for i, p, di, k, s in zip(
-                    x.shape[-2:], self.padding, self.dilation, self.kernel_size, self.stride
-                )
-            ]
-            output_shape = [x.shape[0], self.weight.shape[0]] + output_shape
-            return _NewEmptyTensorOp.apply(x, output_shape)
+            return self.return_empty(x)
 
         x = deform_conv(
             x,
@@ -405,11 +401,10 @@ class DeformConv(nn.Module):
         tmpstr += ", dilation=" + str(self.dilation)
         tmpstr += ", groups=" + str(self.groups)
         tmpstr += ", deformable_groups=" + str(self.deformable_groups)
-        tmpstr += ", bias=False"
         return tmpstr
 
 
-class ModulatedDeformConv(nn.Module):
+class ModulatedDeformConv(DeformConv):
     def __init__(
         self,
         in_channels,
@@ -425,7 +420,7 @@ class ModulatedDeformConv(nn.Module):
         activation=None,
     ):
         """
-        Modulated deformable convolution from :paper:`deformconv2`.
+        Modulated deformable convolution.
 
         Arguments are similar to :class:`Conv2D`. Extra arguments:
 
@@ -461,14 +456,7 @@ class ModulatedDeformConv(nn.Module):
 
     def forward(self, x, offset, mask):
         if x.numel() == 0:
-            output_shape = [
-                (i + 2 * p - (di * (k - 1) + 1)) // s + 1
-                for i, p, di, k, s in zip(
-                    x.shape[-2:], self.padding, self.dilation, self.kernel_size, self.stride
-                )
-            ]
-            output_shape = [x.shape[0], self.weight.shape[0]] + output_shape
-            return _NewEmptyTensorOp.apply(x, output_shape)
+            return self.return_empty(x)
 
         x = modulated_deform_conv(
             x,
@@ -489,13 +477,6 @@ class ModulatedDeformConv(nn.Module):
         return x
 
     def extra_repr(self):
-        tmpstr = "in_channels=" + str(self.in_channels)
-        tmpstr += ", out_channels=" + str(self.out_channels)
-        tmpstr += ", kernel_size=" + str(self.kernel_size)
-        tmpstr += ", stride=" + str(self.stride)
-        tmpstr += ", padding=" + str(self.padding)
-        tmpstr += ", dilation=" + str(self.dilation)
-        tmpstr += ", groups=" + str(self.groups)
-        tmpstr += ", deformable_groups=" + str(self.deformable_groups)
+        tmpstr = super().extra_repr()
         tmpstr += ", bias=" + str(self.with_bias)
         return tmpstr

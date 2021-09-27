@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
 import functools
 import io
@@ -8,12 +8,13 @@ import torch
 
 from detectron2.modeling import meta_arch
 from detectron2.modeling.box_regression import Box2BoxTransform
-from detectron2.modeling.meta_arch.retinanet import permute_to_N_HWA_K
+from detectron2.modeling.meta_arch.panoptic_fpn import combine_semantic_and_instance_outputs
+from detectron2.modeling.postprocessing import detector_postprocess, sem_seg_postprocess
 from detectron2.modeling.roi_heads import keypoint_head
-from detectron2.structures import Boxes, ImageList, Instances, RotatedBoxes
+from detectron2.structures import Boxes, ImageList, Instances
 
 from .c10 import Caffe2Compatible
-from .caffe2_patch import ROIHeadsPatcher, patch_generalized_rcnn
+from .patcher import ROIHeadsPatcher, patch_generalized_rcnn
 from .shared import (
     alias,
     check_set_pb_arg,
@@ -54,10 +55,7 @@ def assemble_rcnn_outputs_by_name(image_sizes, tensor_outputs, force_mask_on=Fal
     assert bbox_nms is not None
     assert score_nms is not None
     assert class_nms is not None
-    if bbox_nms.shape[1] == 5:
-        result.pred_boxes = RotatedBoxes(bbox_nms)
-    else:
-        result.pred_boxes = Boxes(bbox_nms)
+    result.pred_boxes = Boxes(bbox_nms)
     result.scores = score_nms
     result.pred_classes = class_nms.to(torch.int64)
 
@@ -206,8 +204,7 @@ class Caffe2MetaArch(Caffe2Compatible, torch.nn.Module):
         data, im_info = inputs
         data = alias(data, "data")
         im_info = alias(im_info, "im_info")
-        mean, std = self._wrapped_model.pixel_mean, self._wrapped_model.pixel_std
-        normalized_data = (data - mean) / std
+        normalized_data = self._wrapped_model.normalizer(data)
         normalized_data = alias(normalized_data, "normalized_data")
 
         # Pack (data, im_info) into ImageList which is recognized by self.inference.
@@ -229,7 +226,7 @@ class Caffe2MetaArch(Caffe2Compatible, torch.nn.Module):
         Where
 
             * batched_inputs (list[dict]): the original input format of the meta arch
-            * c2_inputs (tuple[Tensor]): the caffe2 inputs.
+            * c2_inputs (dict[str, Tensor]): the caffe2 inputs.
             * c2_results (dict[str, Tensor]): the caffe2 output format,
                 corresponding to the outputs of the :meth:`forward` function.
             * detectron2_outputs: the original output format of the meta arch.
@@ -249,9 +246,7 @@ class Caffe2GeneralizedRCNN(Caffe2MetaArch):
         torch_model = patch_generalized_rcnn(torch_model)
         super().__init__(cfg, torch_model)
 
-        self.roi_heads_patcher = ROIHeadsPatcher(
-            self._wrapped_model.roi_heads, cfg.EXPORT_CAFFE2.USE_HEATMAP_MAX_KEYPOINT
-        )
+        self.roi_heads_patcher = ROIHeadsPatcher(cfg, self._wrapped_model.roi_heads)
 
     def encode_additional_info(self, predict_net, init_net):
         size_divisibility = self._wrapped_model.backbone.size_divisibility
@@ -275,10 +270,104 @@ class Caffe2GeneralizedRCNN(Caffe2MetaArch):
     @staticmethod
     def get_outputs_converter(predict_net, init_net):
         def f(batched_inputs, c2_inputs, c2_results):
-            _, im_info = c2_inputs
-            image_sizes = [[int(im[0]), int(im[1])] for im in im_info]
+            image_sizes = [[int(im[0]), int(im[1])] for im in c2_inputs["im_info"]]
             results = assemble_rcnn_outputs_by_name(image_sizes, c2_results)
             return meta_arch.GeneralizedRCNN._postprocess(results, batched_inputs, image_sizes)
+
+        return f
+
+
+class Caffe2PanopticFPN(Caffe2MetaArch):
+    def __init__(self, cfg, torch_model):
+        assert isinstance(torch_model, meta_arch.PanopticFPN)
+        torch_model = patch_generalized_rcnn(torch_model)
+        super().__init__(cfg, torch_model)
+
+        self.roi_heads_patcher = ROIHeadsPatcher(cfg, self._wrapped_model.roi_heads)
+
+    @mock_torch_nn_functional_interpolate()
+    def forward(self, inputs):
+        assert self.tensor_mode
+        images = self._caffe2_preprocess_image(inputs)
+        features = self._wrapped_model.backbone(images.tensor)
+
+        sem_seg_results, _ = self._wrapped_model.sem_seg_head(features)
+        sem_seg_results = alias(sem_seg_results, "sem_seg")
+
+        proposals, _ = self._wrapped_model.proposal_generator(images, features)
+
+        with self.roi_heads_patcher.mock_roi_heads(self.tensor_mode):
+            detector_results, _ = self._wrapped_model.roi_heads(images, features, proposals)
+
+        return tuple(detector_results[0].flatten()) + (sem_seg_results,)
+
+    def encode_additional_info(self, predict_net, init_net):
+        size_divisibility = self._wrapped_model.backbone.size_divisibility
+        check_set_pb_arg(predict_net, "size_divisibility", "i", size_divisibility)
+        check_set_pb_arg(
+            predict_net, "device", "s", str.encode(str(self._wrapped_model.device), "ascii")
+        )
+        check_set_pb_arg(predict_net, "meta_architecture", "s", b"PanopticFPN")
+
+        # Inference parameters:
+        check_set_pb_arg(predict_net, "combine_on", "i", self._wrapped_model.combine_on)
+        check_set_pb_arg(
+            predict_net,
+            "combine_overlap_threshold",
+            "f",
+            _cast_to_f32(self._wrapped_model.combine_overlap_threshold),
+        )
+        check_set_pb_arg(
+            predict_net,
+            "combine_stuff_area_limit",
+            "i",
+            self._wrapped_model.combine_stuff_area_limit,
+        )
+        check_set_pb_arg(
+            predict_net,
+            "combine_instances_confidence_threshold",
+            "f",
+            _cast_to_f32(self._wrapped_model.combine_instances_confidence_threshold),
+        )
+
+    @staticmethod
+    def get_outputs_converter(predict_net, init_net):
+        combine_on = get_pb_arg_vali(predict_net, "combine_on", None)
+        combine_overlap_threshold = get_pb_arg_valf(predict_net, "combine_overlap_threshold", None)
+        combine_stuff_area_limit = get_pb_arg_vali(predict_net, "combine_stuff_area_limit", None)
+        combine_instances_confidence_threshold = get_pb_arg_valf(
+            predict_net, "combine_instances_confidence_threshold", None
+        )
+
+        def f(batched_inputs, c2_inputs, c2_results):
+            image_sizes = [[int(im[0]), int(im[1])] for im in c2_inputs["im_info"]]
+            detector_results = assemble_rcnn_outputs_by_name(
+                image_sizes, c2_results, force_mask_on=True
+            )
+            sem_seg_results = c2_results["sem_seg"]
+
+            # copied from meta_arch/panoptic_fpn.py ...
+            processed_results = []
+            for sem_seg_result, detector_result, input_per_image, image_size in zip(
+                sem_seg_results, detector_results, batched_inputs, image_sizes
+            ):
+                height = input_per_image.get("height", image_size[0])
+                width = input_per_image.get("width", image_size[1])
+                sem_seg_r = sem_seg_postprocess(sem_seg_result, image_size, height, width)
+                detector_r = detector_postprocess(detector_result, height, width)
+
+                processed_results.append({"sem_seg": sem_seg_r, "instances": detector_r})
+
+                if combine_on:
+                    panoptic_r = combine_semantic_and_instance_outputs(
+                        detector_r,
+                        sem_seg_r.argmax(dim=0),
+                        combine_overlap_threshold,
+                        combine_stuff_area_limit,
+                        combine_instances_confidence_threshold,
+                    )
+                    processed_results[-1]["panoptic_seg"] = panoptic_r
+            return processed_results
 
         return f
 
@@ -298,13 +387,13 @@ class Caffe2RetinaNet(Caffe2MetaArch):
         return_tensors = [images.image_sizes]
 
         features = self._wrapped_model.backbone(images.tensor)
-        features = [features[f] for f in self._wrapped_model.head_in_features]
+        features = [features[f] for f in self._wrapped_model.in_features]
         for i, feature_i in enumerate(features):
             features[i] = alias(feature_i, "feature_{}".format(i), is_backward=True)
             return_tensors.append(features[i])
 
-        pred_logits, pred_anchor_deltas = self._wrapped_model.head(features)
-        for i, (box_cls_i, box_delta_i) in enumerate(zip(pred_logits, pred_anchor_deltas)):
+        box_cls, box_delta = self._wrapped_model.head(features)
+        for i, (box_cls_i, box_delta_i) in enumerate(zip(box_cls, box_delta)):
             return_tensors.append(alias(box_cls_i, "box_cls_{}".format(i)))
             return_tensors.append(alias(box_delta_i, "box_delta_{}".format(i)))
 
@@ -320,13 +409,11 @@ class Caffe2RetinaNet(Caffe2MetaArch):
 
         # Inference parameters:
         check_set_pb_arg(
-            predict_net, "score_threshold", "f", _cast_to_f32(self._wrapped_model.test_score_thresh)
+            predict_net, "score_threshold", "f", _cast_to_f32(self._wrapped_model.score_threshold)
         )
+        check_set_pb_arg(predict_net, "topk_candidates", "i", self._wrapped_model.topk_candidates)
         check_set_pb_arg(
-            predict_net, "topk_candidates", "i", self._wrapped_model.test_topk_candidates
-        )
-        check_set_pb_arg(
-            predict_net, "nms_threshold", "f", _cast_to_f32(self._wrapped_model.test_nms_thresh)
+            predict_net, "nms_threshold", "f", _cast_to_f32(self._wrapped_model.nms_threshold)
         )
         check_set_pb_arg(
             predict_net,
@@ -361,9 +448,9 @@ class Caffe2RetinaNet(Caffe2MetaArch):
         self.anchor_generator = torch.load(serialized_anchor_generator)
         bbox_reg_weights = get_pb_arg_floats(predict_net, "bbox_reg_weights", None)
         self.box2box_transform = Box2BoxTransform(weights=tuple(bbox_reg_weights))
-        self.test_score_thresh = get_pb_arg_valf(predict_net, "score_threshold", None)
-        self.test_topk_candidates = get_pb_arg_vali(predict_net, "topk_candidates", None)
-        self.test_nms_thresh = get_pb_arg_valf(predict_net, "nms_threshold", None)
+        self.score_threshold = get_pb_arg_valf(predict_net, "score_threshold", None)
+        self.topk_candidates = get_pb_arg_vali(predict_net, "topk_candidates", None)
+        self.nms_threshold = get_pb_arg_valf(predict_net, "nms_threshold", None)
         self.max_detections_per_image = get_pb_arg_vali(
             predict_net, "max_detections_per_image", None
         )
@@ -375,25 +462,21 @@ class Caffe2RetinaNet(Caffe2MetaArch):
         )
 
         def f(batched_inputs, c2_inputs, c2_results):
-            _, im_info = c2_inputs
-            image_sizes = [[int(im[0]), int(im[1])] for im in im_info]
+            image_sizes = [[int(im[0]), int(im[1])] for im in c2_inputs["im_info"]]
 
             num_features = len([x for x in c2_results.keys() if x.startswith("box_cls_")])
-            pred_logits = [c2_results["box_cls_{}".format(i)] for i in range(num_features)]
-            pred_anchor_deltas = [c2_results["box_delta_{}".format(i)] for i in range(num_features)]
+            box_cls = [c2_results["box_cls_{}".format(i)] for i in range(num_features)]
+            box_delta = [c2_results["box_delta_{}".format(i)] for i in range(num_features)]
 
             # For each feature level, feature should have the same batch size and
             # spatial dimension as the box_cls and box_delta.
-            dummy_features = [x.clone()[:, 0:0, :, :] for x in pred_logits]
+            dummy_features = [box_delta[i].clone()[:, 0:0, :, :] for i in range(num_features)]
             anchors = self.anchor_generator(dummy_features)
 
             # self.num_classess can be inferred
-            self.num_classes = pred_logits[0].shape[1] // (pred_anchor_deltas[0].shape[1] // 4)
+            self.num_classes = box_cls[0].shape[1] // (box_delta[0].shape[1] // 4)
 
-            pred_logits = [permute_to_N_HWA_K(x, self.num_classes) for x in pred_logits]
-            pred_anchor_deltas = [permute_to_N_HWA_K(x, 4) for x in pred_anchor_deltas]
-
-            results = self.inference(anchors, pred_logits, pred_anchor_deltas, image_sizes)
+            results = self.inference(box_cls, box_delta, anchors, image_sizes)
             return meta_arch.GeneralizedRCNN._postprocess(results, batched_inputs, image_sizes)
 
         return f
@@ -401,5 +484,6 @@ class Caffe2RetinaNet(Caffe2MetaArch):
 
 META_ARCH_CAFFE2_EXPORT_TYPE_MAP = {
     "GeneralizedRCNN": Caffe2GeneralizedRCNN,
+    "PanopticFPN": Caffe2PanopticFPN,
     "RetinaNet": Caffe2RetinaNet,
 }

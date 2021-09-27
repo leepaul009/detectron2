@@ -1,11 +1,5 @@
-detectron2.data
+detectron2.data package
 =======================
-
-.. autodata:: detectron2.data.DatasetCatalog(dict)
-    :annotation:
-
-.. autodata:: detectron2.data.MetadataCatalog(dict)
-    :annotation:
 
 .. automodule:: detectron2.data
     :members:
@@ -32,6 +26,15 @@ detectron2.data.samplers module
 ---------------------------------------
 
 .. automodule:: detectron2.data.samplers
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+
+detectron2.data.transforms module
+---------------------------------------
+
+.. automodule:: detectron2.data.transforms
     :members:
     :undoc-members:
     :show-inheritance:

@@ -6,7 +6,6 @@ API Documentation
     checkpoint
     config
     data
-    data_transforms
     engine
     evaluation
     layers
@@ -16,4 +15,3 @@ API Documentation
     structures
     utils
     export
-    fvcore

@@ -1,18 +1,17 @@
-detectron2.config
+detectron2.config package
 =========================
-
-Related tutorials: :doc:`../tutorials/configs`, :doc:`../tutorials/extend`.
 
 .. automodule:: detectron2.config
     :members:
     :undoc-members:
     :show-inheritance:
+    :inherited-members:
 
 
-Yaml Config References
+Config References
 -----------------
 
 .. literalinclude:: ../../detectron2/config/defaults.py
   :language: python
   :linenos:
-  :lines: 7-
+  :lines: 4-

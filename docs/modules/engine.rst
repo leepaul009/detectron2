@@ -1,7 +1,6 @@
-detectron2.engine 
+detectron2.engine package
 =========================
 
-Related tutorial: :doc:`../tutorials/training`.
 
 .. automodule:: detectron2.engine
     :members:

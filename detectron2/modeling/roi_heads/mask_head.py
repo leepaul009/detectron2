@@ -1,23 +1,14 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 from typing import List
 import fvcore.nn.weight_init as weight_init
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from detectron2.config import configurable
 from detectron2.layers import Conv2d, ConvTranspose2d, ShapeSpec, cat, get_norm
 from detectron2.structures import Instances
 from detectron2.utils.events import get_event_storage
 from detectron2.utils.registry import Registry
-
-__all__ = [
-    "BaseMaskRCNNHead",
-    "MaskRCNNConvUpsampleHead",
-    "build_mask_head",
-    "ROI_MASK_HEAD_REGISTRY",
-]
-
 
 ROI_MASK_HEAD_REGISTRY = Registry("ROI_MASK_HEAD")
 ROI_MASK_HEAD_REGISTRY.__doc__ = """
@@ -28,8 +19,7 @@ The registered object will be called with `obj(cfg, input_shape)`.
 """
 
 
-@torch.jit.unused
-def mask_rcnn_loss(pred_mask_logits: torch.Tensor, instances: List[Instances], vis_period: int = 0):
+def mask_rcnn_loss(pred_mask_logits, instances, vis_period=0):
     """
     Compute the mask prediction loss defined in the Mask R-CNN paper.
 
@@ -111,7 +101,7 @@ def mask_rcnn_loss(pred_mask_logits: torch.Tensor, instances: List[Instances], v
     return mask_loss
 
 
-def mask_rcnn_inference(pred_mask_logits: torch.Tensor, pred_instances: List[Instances]):
+def mask_rcnn_inference(pred_mask_logits, pred_instances):
     """
     Convert pred_mask_logits to estimated foreground probability masks while also
     extracting only the masks for the predicted classes in pred_instances. For each
@@ -154,25 +144,12 @@ def mask_rcnn_inference(pred_mask_logits: torch.Tensor, pred_instances: List[Ins
 
 class BaseMaskRCNNHead(nn.Module):
     """
-    Implement the basic Mask R-CNN losses and inference logic described in :paper:`Mask R-CNN`
+    Implement the basic Mask R-CNN losses and inference logic.
     """
 
-    @configurable
-    def __init__(self, *, loss_weight: float = 1.0, vis_period: int = 0):
-        """
-        NOTE: this interface is experimental.
-
-        Args:
-            loss_weight (float): multiplier of the loss
-            vis_period (int): visualization period
-        """
+    def __init__(self, cfg, input_shape):
         super().__init__()
-        self.vis_period = vis_period
-        self.loss_weight = loss_weight
-
-    @classmethod
-    def from_config(cls, cfg, input_shape):
-        return {"vis_period": cfg.VIS_PERIOD}
+        self.vis_period = cfg.VIS_PERIOD
 
     def forward(self, x, instances: List[Instances]):
         """
@@ -190,7 +167,7 @@ class BaseMaskRCNNHead(nn.Module):
         """
         x = self.layers(x)
         if self.training:
-            return {"loss_mask": mask_rcnn_loss(x, instances, self.vis_period) * self.loss_weight}
+            return {"loss_mask": mask_rcnn_loss(x, instances, self.vis_period)}
         else:
             mask_rcnn_inference(x, instances)
             return instances
@@ -202,58 +179,56 @@ class BaseMaskRCNNHead(nn.Module):
         raise NotImplementedError
 
 
-# To get torchscript support, we make the head a subclass of `nn.Sequential`.
-# Therefore, to add new layers in this head class, please make sure they are
-# added in the order they will be used in forward().
 @ROI_MASK_HEAD_REGISTRY.register()
-class MaskRCNNConvUpsampleHead(BaseMaskRCNNHead, nn.Sequential):
+class MaskRCNNConvUpsampleHead(BaseMaskRCNNHead):
     """
     A mask head with several conv layers, plus an upsample layer (with `ConvTranspose2d`).
-    Predictions are made with a final 1x1 conv layer.
     """
 
-    @configurable
-    def __init__(self, input_shape: ShapeSpec, *, num_classes, conv_dims, conv_norm="", **kwargs):
+    def __init__(self, cfg, input_shape: ShapeSpec):
         """
-        NOTE: this interface is experimental.
+        The following attributes are parsed from config:
+            num_conv: the number of conv layers
+            conv_dim: the dimension of the conv layers
+            norm: normalization for the conv layers
+        """
+        super().__init__(cfg, input_shape)
 
-        Args:
-            input_shape (ShapeSpec): shape of the input feature
-            num_classes (int): the number of foreground classes (i.e. background is not
-                included). 1 if using class agnostic prediction.
-            conv_dims (list[int]): a list of N>0 integers representing the output dimensions
-                of N-1 conv layers and the last upsample layer.
-            conv_norm (str or callable): normalization for the conv layers.
-                See :func:`detectron2.layers.get_norm` for supported types.
-        """
-        super().__init__(**kwargs)
-        assert len(conv_dims) >= 1, "conv_dims have to be non-empty!"
+        # fmt: off
+        num_classes       = cfg.MODEL.ROI_HEADS.NUM_CLASSES
+        conv_dims         = cfg.MODEL.ROI_MASK_HEAD.CONV_DIM
+        self.norm         = cfg.MODEL.ROI_MASK_HEAD.NORM
+        num_conv          = cfg.MODEL.ROI_MASK_HEAD.NUM_CONV
+        input_channels    = input_shape.channels
+        cls_agnostic_mask = cfg.MODEL.ROI_MASK_HEAD.CLS_AGNOSTIC_MASK
+        # fmt: on
 
         self.conv_norm_relus = []
 
-        cur_channels = input_shape.channels
-        for k, conv_dim in enumerate(conv_dims[:-1]):
+        for k in range(num_conv):
             conv = Conv2d(
-                cur_channels,
-                conv_dim,
+                input_channels if k == 0 else conv_dims,
+                conv_dims,
                 kernel_size=3,
                 stride=1,
                 padding=1,
-                bias=not conv_norm,
-                norm=get_norm(conv_norm, conv_dim),
-                activation=nn.ReLU(),
+                bias=not self.norm,
+                norm=get_norm(self.norm, conv_dims),
+                activation=F.relu,
             )
             self.add_module("mask_fcn{}".format(k + 1), conv)
             self.conv_norm_relus.append(conv)
-            cur_channels = conv_dim
 
         self.deconv = ConvTranspose2d(
-            cur_channels, conv_dims[-1], kernel_size=2, stride=2, padding=0
+            conv_dims if num_conv > 0 else input_channels,
+            conv_dims,
+            kernel_size=2,
+            stride=2,
+            padding=0,
         )
-        self.add_module("deconv_relu", nn.ReLU())
-        cur_channels = conv_dims[-1]
 
-        self.predictor = Conv2d(cur_channels, num_classes, kernel_size=1, stride=1, padding=0)
+        num_mask_classes = 1 if cls_agnostic_mask else num_classes
+        self.predictor = Conv2d(conv_dims, num_mask_classes, kernel_size=1, stride=1, padding=0)
 
         for layer in self.conv_norm_relus + [self.deconv]:
             weight_init.c2_msra_fill(layer)
@@ -262,26 +237,11 @@ class MaskRCNNConvUpsampleHead(BaseMaskRCNNHead, nn.Sequential):
         if self.predictor.bias is not None:
             nn.init.constant_(self.predictor.bias, 0)
 
-    @classmethod
-    def from_config(cls, cfg, input_shape):
-        ret = super().from_config(cfg, input_shape)
-        conv_dim = cfg.MODEL.ROI_MASK_HEAD.CONV_DIM
-        num_conv = cfg.MODEL.ROI_MASK_HEAD.NUM_CONV
-        ret.update(
-            conv_dims=[conv_dim] * (num_conv + 1),  # +1 for ConvTranspose
-            conv_norm=cfg.MODEL.ROI_MASK_HEAD.NORM,
-            input_shape=input_shape,
-        )
-        if cfg.MODEL.ROI_MASK_HEAD.CLS_AGNOSTIC_MASK:
-            ret["num_classes"] = 1
-        else:
-            ret["num_classes"] = cfg.MODEL.ROI_HEADS.NUM_CLASSES
-        return ret
-
     def layers(self, x):
-        for layer in self:
+        for layer in self.conv_norm_relus:
             x = layer(x)
-        return x
+        x = F.relu(self.deconv(x))
+        return self.predictor(x)
 
 
 def build_mask_head(cfg, input_shape):

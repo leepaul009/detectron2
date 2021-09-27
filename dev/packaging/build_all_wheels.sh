@@ -1,14 +1,9 @@
 #!/bin/bash -e
-# Copyright (c) Facebook, Inc. and its affiliates.
 
-[[ -d "dev/packaging" ]] || {
-  echo "Please run this script at detectron2 root!"
-  exit 1
-}
+PYTORCH_VERSION=1.4
 
-build_one() {
+build_for_one_cuda() {
   cu=$1
-  pytorch_ver=$2
 
   case "$cu" in
     cu*)
@@ -24,46 +19,38 @@ build_one() {
   esac
 
   echo "Launching container $container_name ..."
-  container_id="$container_name"_"$cu"_"$pytorch_ver"
 
-  py_versions=(3.6 3.7 3.8)
-  if [[ $pytorch_ver != "1.7" ]]; then
-    py_versions+=(3.9)
-  fi
-
-  for py in "${py_versions[@]}"; do
+  for py in 3.6 3.7 3.8; do
     docker run -itd \
-      --name "$container_id" \
+      --name $container_name \
       --mount type=bind,source="$(pwd)",target=/detectron2 \
       pytorch/$container_name
 
-    cat <<EOF | docker exec -i $container_id sh
+    cat <<EOF | docker exec -i $container_name sh
       export CU_VERSION=$cu D2_VERSION_SUFFIX=+$cu PYTHON_VERSION=$py
-      export PYTORCH_VERSION=$pytorch_ver
+      export PYTORCH_VERSION=$PYTORCH_VERSION
       cd /detectron2 && ./dev/packaging/build_wheel.sh
 EOF
 
-    docker container stop $container_id
-    docker container rm $container_id
+    if [[ "$cu" == "cu101" ]]; then
+      # build wheel without local version
+      cat <<EOF | docker exec -i $container_name sh
+        export CU_VERSION=$cu D2_VERSION_SUFFIX= PYTHON_VERSION=$py
+        export PYTORCH_VERSION=$PYTORCH_VERSION
+        cd /detectron2 && ./dev/packaging/build_wheel.sh
+EOF
+    fi
+
+    docker exec -i $container_name rm -rf /detectron2/build/$cu
+    docker container stop $container_name
+    docker container rm $container_name
   done
 }
 
-
-if [[ -n "$1" ]] && [[ -n "$2" ]]; then
-  build_one "$1" "$2"
+if [[ -n "$1" ]]; then
+  build_for_one_cuda "$1"
 else
-  build_one cu111 1.9
-  build_one cu102 1.9
-  build_one cpu 1.9
-
-  build_one cu111 1.8
-  build_one cu102 1.8
-  build_one cu101 1.8
-  build_one cpu 1.8
-
-  build_one cu110 1.7
-  build_one cu102 1.7
-  build_one cu101 1.7
-  build_one cu92 1.7
-  build_one cpu 1.7
+  for cu in cu101 cu100 cu92 cpu; do
+    build_for_one_cuda "$cu"
+  done
 fi

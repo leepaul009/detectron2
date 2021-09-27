@@ -1,7 +1,5 @@
-detectron2.export 
+detectron2.export package
 =========================
-
-Related tutorial: :doc:`../tutorials/deployment`.
 
 .. automodule:: detectron2.export
     :members:
